@@ -85,6 +85,7 @@ let toastTimer = null;
 let cancelRequested = false;
 let processing = false;
 let lastResultBytes = null;
+let selectionVersion = 0;
 
 class CancelledError extends Error {
   constructor() {
@@ -201,6 +202,8 @@ function resetPreview() {
 }
 
 async function resetApp() {
+  selectionVersion += 1;
+
   if (processing) {
     cancelRequested = true;
     activeRenderTask?.cancel();
@@ -218,8 +221,8 @@ async function resetApp() {
   updateProgress(0, "Preparando documento…");
 }
 
-async function renderPreview() {
-  const page = await sourcePdf.getPage(1);
+async function renderPreview(pdf = sourcePdf) {
+  const page = await pdf.getPage(1);
   const baseViewport = page.getViewport({ scale: 1 });
   const displayWidth = Math.min(280, baseViewport.width);
   const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
@@ -258,7 +261,11 @@ async function selectFile(file) {
     return;
   }
 
+  const currentSelection = ++selectionVersion;
+  activeRenderTask?.cancel();
   await disposeSource();
+  if (currentSelection !== selectionVersion) return;
+
   clearResultUrl();
   selectedFile = file;
   sourceMetadata = null;
@@ -271,32 +278,46 @@ async function selectFile(file) {
 
   try {
     const data = new Uint8Array(await file.arrayBuffer());
-    loadingTask = pdfjsLib.getDocument(pdfLoadOptions(data));
-    loadingTask.onPassword = () => {
+    if (currentSelection !== selectionVersion) return;
+
+    const task = pdfjsLib.getDocument(pdfLoadOptions(data));
+    loadingTask = task;
+    task.onPassword = () => {
       passwordRequired = true;
-      loadingTask?.destroy();
+      task.destroy();
     };
 
-    sourcePdf = await loadingTask.promise;
-    sourceMetadata = await sourcePdf.getMetadata().catch(() => null);
+    const pdf = await task.promise;
+    if (currentSelection !== selectionVersion) {
+      await task.destroy();
+      return;
+    }
+
+    sourcePdf = pdf;
+    sourceMetadata = await pdf.getMetadata().catch(() => null);
+    if (currentSelection !== selectionVersion) return;
 
     elements.fileName.textContent = file.name;
     elements.originalSize.textContent = formatBytes(file.size);
-    elements.pageCount.textContent = String(sourcePdf.numPages);
-    elements.previewPages.textContent = `${sourcePdf.numPages} ${
-      sourcePdf.numPages === 1 ? "página" : "páginas"
+    elements.pageCount.textContent = String(pdf.numPages);
+    elements.previewPages.textContent = `${pdf.numPages} ${
+      pdf.numPages === 1 ? "página" : "páginas"
     }`;
 
-    await renderPreview();
+    await renderPreview(pdf);
+    if (currentSelection !== selectionVersion) return;
+
     setFileState(true);
     elements.compressButton.disabled = false;
-    elements.liveRegion.textContent = `${file.name}, ${sourcePdf.numPages} páginas, listo para comprimir.`;
+    elements.liveRegion.textContent = `${file.name}, ${pdf.numPages} páginas, listo para comprimir.`;
 
     const targetBytes = Number(elements.targetSize.value) * 1_000_000;
     if (file.size < targetBytes) {
       showToast("Este archivo ya cumple el tamaño indicado. Si continúas, se entregará sin alterar.");
     }
   } catch (error) {
+    if (currentSelection !== selectionVersion) return;
+
     await disposeSource();
     selectedFile = null;
     setFileState(false);
